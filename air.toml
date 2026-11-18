@@ -1,0 +1,8 @@
+root = "."
+tmp_dir = "tmp"
+
+[build]
+cmd = "go build -o ./tmp/attendance ./cmd/attendance"
+bin = "./tmp/attendance"
+include_ext = ["go"]
+exclude_dir = ["tmp", "docs", "vendor"]

@@ -2,3 +2,4 @@
 /cmd/attendance/attendance
 .env
 *.db
+tmp/
