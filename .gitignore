@@ -1,4 +1,5 @@
 /attendance
+/bin/
 /cmd/attendance/attendance
 .env
 *.db
