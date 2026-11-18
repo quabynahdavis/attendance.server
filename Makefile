@@ -3,14 +3,20 @@ GOFLAGS := -trimpath
 MAIN_PKG := ./cmd/attendance
 BIN_DIR := bin
 BINARY := $(BIN_DIR)/attendance
+GOTMPDIR := $(CURDIR)/.gotmp
+export GOTMPDIR
+export TMPDIR := $(GOTMPDIR)
 
 .DEFAULT_GOAL := help
 
 .PHONY: all build env run seed dev test test-coverage bench lint fmt vet deps install clean check docker up help
 
+$(GOTMPDIR):
+	mkdir -p $(GOTMPDIR)
+
 all: build
 
-$(BINARY): $(shell find . -name '*.go' -not -path './vendor/*' -not -path './bin/*')
+$(BINARY): $(shell find . -name '*.go' -not -path './vendor/*' -not -path './bin/*') | $(GOTMPDIR)
 	mkdir -p $(BIN_DIR)
 	$(GO) build $(GOFLAGS) -o $(BINARY) $(MAIN_PKG)
 
@@ -22,10 +28,10 @@ env:
 run: build
 	set -a; [ -f .env ] && . ./.env; set +a; exec $(BINARY)
 
-seed: env
+seed: env | $(GOTMPDIR)
 	set -a; [ -f .env ] && . ./.env; set +a; $(GO) run ./cmd/seed
 
-dev:
+dev: | $(GOTMPDIR)
 	@set -a; [ -f .env ] && . ./.env; set +a; \
 	if ! command -v air >/dev/null 2>&1; then \
 		echo "air is not installed; install github.com/air-verse/air"; \
@@ -33,14 +39,14 @@ dev:
 	fi; \
 	exec air -c air.toml
 
-test:
+test: | $(GOTMPDIR)
 	$(GO) test ./... -count=1
 
-test-coverage:
+test-coverage: | $(GOTMPDIR)
 	$(GO) test ./... -count=1 -coverprofile=coverage.out
 	$(GO) tool cover -html=coverage.out -o coverage.html
 
-bench:
+bench: | $(GOTMPDIR)
 	$(GO) test ./... -bench=. -benchmem -count=3
 
 lint:
@@ -50,13 +56,13 @@ lint:
 	fi
 	golangci-lint run ./...
 
-fmt:
+fmt: | $(GOTMPDIR)
 	$(GO) fmt ./...
 
-vet:
+vet: | $(GOTMPDIR)
 	$(GO) vet ./...
 
-deps:
+deps: | $(GOTMPDIR)
 	$(GO) mod download
 	$(GO) mod tidy
 
@@ -64,7 +70,7 @@ install: $(BINARY)
 	cp $(BINARY) $(shell $(GO) env GOPATH)/bin/attendance
 
 clean:
-	rm -rf $(BIN_DIR) coverage.out coverage.html
+	rm -rf $(BIN_DIR) $(GOTMPDIR) coverage.out coverage.html
 
 check: fmt vet test build
 
@@ -92,7 +98,7 @@ help:
 	@echo "  vet             Run go vet"
 	@echo "  deps            Download modules and tidy go.mod"
 	@echo "  install         Copy $(BINARY) into GOPATH/bin"
-	@echo "  clean           Remove the binary directory and coverage files"
+	@echo "  clean           Remove the binary directory, .gotmp, and coverage files"
 	@echo "  check           Format, vet, test, and build"
 	@echo "  docker          Build the attendance image"
 	@echo "  up              Build and start containers with Docker Compose"

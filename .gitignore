@@ -1,5 +1,6 @@
 /attendance
 /bin/
+.gotmp/
 /cmd/attendance/attendance
 .env
 *.db
