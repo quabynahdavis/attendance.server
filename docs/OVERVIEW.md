@@ -2,13 +2,13 @@
 
 This folder is the contract for a Go attendance server that is not implemented yet. Build to this contract. These documents are not a description of existing code.
 
-The server is a cloud HTTPS service. Clients call the public base URL in `ATTENDANCE_URL`. The platform terminates TLS and sets `PORT`. The Go process listens for HTTP on `PORT`. When `PORT` is unset, the process listens on port 8080. That default is for local development. There are no user accounts and no SSO. The server does not receive Bluetooth or audio. It checks only the JSON that a client submits.
+The server is a cloud HTTPS service. The platform terminates TLS. The Go process listens for HTTP on `PORT`. When `PORT` is unset, the process listens on port 8080. Clients reach that port. There is no URL setting. There are no user accounts and no SSO. The server does not receive Bluetooth or audio. It checks only the JSON that a client submits.
 
 ## Runtime
 
-The Go module root is `server/`. HTTP comes from the standard library `net/http`. The process listens on the TCP port named by `PORT`. The public base URL is `ATTENDANCE_URL`.
+The Go module root is `server/`. HTTP comes from the standard library `net/http`. The process listens on the TCP port named by `PORT`. When `PORT` is unset, the process listens on port 8080. Clients reach that port. There is no URL setting.
 
-The database is Postgres through the connection string `DATABASE_URL`, as specified in `data/OVERVIEW.md`. A file on the instance disk does not survive normal cloud deploys. Routes are specified in `http/OVERVIEW.md`. Signatures are specified in `crypto/OVERVIEW.md`.
+The database is a single SQLite file, as specified in `data/OVERVIEW.md`. The path comes from `ATTENDANCE_DB`. When `ATTENDANCE_DB` is unset, the file is `attendance.db` in the working directory. The server opens it with `database/sql` and the driver `modernc.org/sqlite`. The server does not use CGO. Foreign keys are enabled on the connection. On cloud, the SQLite file must live on a persistent disk. The container compose file mounts a volume for it. Routes are specified in `http/OVERVIEW.md`. Signatures are specified in `crypto/OVERVIEW.md`.
 
 A later implementation should use this layout. Do not treat these paths as files that already exist:
 

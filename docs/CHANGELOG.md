@@ -2,4 +2,4 @@
 
 ## 2026-11-18
 
-The contract moved to cloud Postgres and the route set was expanded. The server is a cloud HTTPS service. The database is Postgres via `DATABASE_URL`. The routes cover students, lecturers, courses, rosters, lectures, and attendance.
+The route set was expanded. The server is a cloud HTTPS service. The database is SQLite. The path comes from `ATTENDANCE_DB`. The routes cover students, lecturers, courses, rosters, lectures, and attendance. The server has no base URL, only `PORT`.
