@@ -23,6 +23,7 @@ A later implementation should use this layout. Do not treat these paths as files
 - `http/` is the HTTP contract. Start at `http/OVERVIEW.md`.
 - `crypto/` is the signature contract. Start at `crypto/OVERVIEW.md`.
 - `data/` is the database contract. Start at `data/OVERVIEW.md`.
+- `demo/` describes the demo seed. Start at `demo/OVERVIEW.md`.
 
 ## Out of scope
 
