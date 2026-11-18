@@ -1,0 +1,4 @@
+/attendance
+/cmd/attendance/attendance
+.env
+*.db
