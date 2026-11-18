@@ -1,4 +1,4 @@
-// Package store persists attendance rows in Postgres through database/sql.
+// Package store persists attendance rows in SQLite through database/sql.
 package store
 
 import (
@@ -6,9 +6,10 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"errors"
+	"fmt"
+	"strings"
 
-	"github.com/jackc/pgx/v5/pgconn"
-	_ "github.com/jackc/pgx/v5/stdlib"
+	"modernc.org/sqlite"
 )
 
 // ErrNotFound is returned when a required row does not exist.
@@ -93,17 +94,23 @@ type SummaryStudent struct {
 	Attended    int
 }
 
-// Store is a Postgres-backed attendance database.
+// Store is a SQLite-backed attendance database.
 type Store struct {
 	db *sql.DB
 }
 
-// Open opens DATABASE_URL with the pgx database/sql driver and creates missing tables.
-func Open(databaseURL string) (*Store, error) {
-	db, err := sql.Open("pgx", databaseURL)
+// Open opens a SQLite file and creates missing tables.
+// An empty path uses attendance.db. Foreign keys and a busy timeout are enabled on each connection.
+func Open(path string) (*Store, error) {
+	if path == "" {
+		path = "attendance.db"
+	}
+	dsn := path + "?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)"
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
+	db.SetMaxOpenConns(1)
 	s := &Store{db: db}
 	if err := s.migrate(context.Background()); err != nil {
 		_ = db.Close()
@@ -121,40 +128,40 @@ func (s *Store) migrate(ctx context.Context) error {
 	_, err := s.db.ExecContext(ctx, `
 CREATE TABLE IF NOT EXISTS students (
   index_number TEXT PRIMARY KEY,
-  public_key BYTEA NOT NULL,
+  public_key BLOB NOT NULL,
   display_name TEXT
 );
 CREATE TABLE IF NOT EXISTS lecturers (
-  id BYTEA PRIMARY KEY,
-  public_key BYTEA NOT NULL,
+  id BLOB PRIMARY KEY,
+  public_key BLOB NOT NULL,
   display_name TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS courses (
-  id BYTEA PRIMARY KEY,
+  id BLOB PRIMARY KEY,
   code TEXT NOT NULL UNIQUE,
   title TEXT NOT NULL,
-  lecturer_id BYTEA NOT NULL REFERENCES lecturers(id)
+  lecturer_id BLOB NOT NULL REFERENCES lecturers(id)
 );
 CREATE TABLE IF NOT EXISTS roster (
-  course_id BYTEA NOT NULL REFERENCES courses(id),
+  course_id BLOB NOT NULL REFERENCES courses(id),
   index_number TEXT NOT NULL REFERENCES students(index_number),
   PRIMARY KEY (course_id, index_number)
 );
 CREATE TABLE IF NOT EXISTS lectures (
-  id BYTEA PRIMARY KEY,
-  course_id BYTEA NOT NULL REFERENCES courses(id),
-  starts_at BIGINT NOT NULL,
-  ends_at BIGINT
+  id BLOB PRIMARY KEY,
+  course_id BLOB NOT NULL REFERENCES courses(id),
+  starts_at INTEGER NOT NULL,
+  ends_at INTEGER
 );
 CREATE TABLE IF NOT EXISTS attendance (
   index_number TEXT NOT NULL,
-  lecture_id BYTEA NOT NULL,
-  nonce BYTEA NOT NULL,
-  issued_at BIGINT NOT NULL,
-  rssi INT NOT NULL,
-  chirp_ok BOOLEAN NOT NULL,
+  lecture_id BLOB NOT NULL,
+  nonce BLOB NOT NULL,
+  issued_at INTEGER NOT NULL,
+  rssi INTEGER NOT NULL,
+  chirp_ok INTEGER NOT NULL,
   source TEXT NOT NULL CHECK (source IN ('sensor', 'manual')),
-  created_at BIGINT NOT NULL,
+  created_at INTEGER NOT NULL,
   PRIMARY KEY (index_number, lecture_id)
 );
 `)
@@ -167,7 +174,7 @@ CREATE TABLE IF NOT EXISTS attendance (
 func (s *Store) RegisterStudent(ctx context.Context, index string, publicKey []byte, displayName *string) (bool, error) {
 	res, err := s.db.ExecContext(ctx, `
 INSERT INTO students (index_number, public_key, display_name)
-VALUES ($1, $2, $3)
+VALUES (?, ?, ?)
 ON CONFLICT (index_number) DO NOTHING
 `, index, publicKey, displayName)
 	if err != nil {
@@ -181,7 +188,7 @@ ON CONFLICT (index_number) DO NOTHING
 		return false, nil
 	}
 	var stored []byte
-	err = s.db.QueryRowContext(ctx, `SELECT public_key FROM students WHERE index_number = $1`, index).Scan(&stored)
+	err = s.db.QueryRowContext(ctx, `SELECT public_key FROM students WHERE index_number = ?`, index).Scan(&stored)
 	if err != nil {
 		return false, err
 	}
@@ -195,7 +202,7 @@ ON CONFLICT (index_number) DO NOTHING
 func (s *Store) GetStudent(ctx context.Context, index string) (Student, error) {
 	var st Student
 	err := s.db.QueryRowContext(ctx, `
-SELECT index_number, public_key, display_name FROM students WHERE index_number = $1
+SELECT index_number, public_key, display_name FROM students WHERE index_number = ?
 `, index).Scan(&st.IndexNumber, &st.PublicKey, &st.DisplayName)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Student{}, ErrNotFound
@@ -213,7 +220,7 @@ SELECT a.lecture_id, l.course_id, c.code, a.issued_at, a.chirp_ok, a.source, a.c
 FROM attendance a
 JOIN lectures l ON l.id = a.lecture_id
 JOIN courses c ON c.id = l.course_id
-WHERE a.index_number = $1
+WHERE a.index_number = ?
 ORDER BY a.created_at, a.lecture_id
 `, index)
 	if err != nil {
@@ -223,9 +230,11 @@ ORDER BY a.created_at, a.lecture_id
 	out := []StudentAttendance{}
 	for rows.Next() {
 		var row StudentAttendance
-		if err := rows.Scan(&row.LectureID, &row.CourseID, &row.CourseCode, &row.IssuedAt, &row.ChirpOK, &row.Source, &row.CreatedAt); err != nil {
+		var chirp intBool
+		if err := rows.Scan(&row.LectureID, &row.CourseID, &row.CourseCode, &row.IssuedAt, &chirp, &row.Source, &row.CreatedAt); err != nil {
 			return nil, err
 		}
+		row.ChirpOK = bool(chirp)
 		out = append(out, row)
 	}
 	return out, rows.Err()
@@ -236,7 +245,7 @@ func (s *Store) CreateLecturer(ctx context.Context, displayName string, publicKe
 	var id []byte
 	err := withNewID(func(candidate []byte) error {
 		_, err := s.db.ExecContext(ctx, `
-INSERT INTO lecturers (id, public_key, display_name) VALUES ($1, $2, $3)
+INSERT INTO lecturers (id, public_key, display_name) VALUES (?, ?, ?)
 `, candidate, publicKey, displayName)
 		if err != nil {
 			return err
@@ -251,7 +260,7 @@ INSERT INTO lecturers (id, public_key, display_name) VALUES ($1, $2, $3)
 func (s *Store) GetLecturer(ctx context.Context, id []byte) (Lecturer, error) {
 	var lec Lecturer
 	err := s.db.QueryRowContext(ctx, `
-SELECT id, public_key, display_name FROM lecturers WHERE id = $1
+SELECT id, public_key, display_name FROM lecturers WHERE id = ?
 `, id).Scan(&lec.ID, &lec.PublicKey, &lec.DisplayName)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Lecturer{}, ErrNotFound
@@ -264,7 +273,7 @@ func (s *Store) ListLecturerCourses(ctx context.Context, id []byte) ([]Course, e
 	if _, err := s.GetLecturer(ctx, id); err != nil {
 		return nil, err
 	}
-	return s.queryCourses(ctx, `SELECT id, code, title, lecturer_id FROM courses WHERE lecturer_id = $1 ORDER BY code, id`, id)
+	return s.queryCourses(ctx, `SELECT id, code, title, lecturer_id FROM courses WHERE lecturer_id = ? ORDER BY code, id`, id)
 }
 
 // CreateCourse inserts a course. ErrNotFound if the lecturer is missing. ErrConflict if code exists.
@@ -275,11 +284,11 @@ func (s *Store) CreateCourse(ctx context.Context, code, title string, lecturerID
 	var id []byte
 	err := withNewID(func(candidate []byte) error {
 		_, err := s.db.ExecContext(ctx, `
-INSERT INTO courses (id, code, title, lecturer_id) VALUES ($1, $2, $3, $4)
+INSERT INTO courses (id, code, title, lecturer_id) VALUES (?, ?, ?, ?)
 `, candidate, code, title, lecturerID)
 		if isUnique(err) {
-			var exists bool
-			qerr := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM courses WHERE code = $1)`, code).Scan(&exists)
+			var exists intBool
+			qerr := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM courses WHERE code = ?)`, code).Scan(&exists)
 			if qerr != nil {
 				return qerr
 			}
@@ -304,7 +313,7 @@ func (s *Store) ListCourses(ctx context.Context) ([]Course, error) {
 
 // GetCourse returns one course.
 func (s *Store) GetCourse(ctx context.Context, id []byte) (Course, error) {
-	rows, err := s.queryCourses(ctx, `SELECT id, code, title, lecturer_id FROM courses WHERE id = $1`, id)
+	rows, err := s.queryCourses(ctx, `SELECT id, code, title, lecturer_id FROM courses WHERE id = ?`, id)
 	if err != nil {
 		return Course{}, err
 	}
@@ -323,7 +332,7 @@ func (s *Store) AddRoster(ctx context.Context, courseID []byte, index string) er
 		return err
 	}
 	_, err := s.db.ExecContext(ctx, `
-INSERT INTO roster (course_id, index_number) VALUES ($1, $2)
+INSERT INTO roster (course_id, index_number) VALUES (?, ?)
 ON CONFLICT (course_id, index_number) DO NOTHING
 `, courseID, index)
 	return err
@@ -334,7 +343,7 @@ func (s *Store) RemoveRoster(ctx context.Context, courseID []byte, index string)
 	if _, err := s.GetCourse(ctx, courseID); err != nil {
 		return err
 	}
-	_, err := s.db.ExecContext(ctx, `DELETE FROM roster WHERE course_id = $1 AND index_number = $2`, courseID, index)
+	_, err := s.db.ExecContext(ctx, `DELETE FROM roster WHERE course_id = ? AND index_number = ?`, courseID, index)
 	return err
 }
 
@@ -347,7 +356,7 @@ func (s *Store) ListRoster(ctx context.Context, courseID []byte) ([]RosterEntry,
 SELECT s.index_number, s.display_name
 FROM roster r
 JOIN students s ON s.index_number = r.index_number
-WHERE r.course_id = $1
+WHERE r.course_id = ?
 ORDER BY s.index_number
 `, courseID)
 	if err != nil {
@@ -367,11 +376,11 @@ ORDER BY s.index_number
 
 // OnRoster reports whether the student is on the course roster.
 func (s *Store) OnRoster(ctx context.Context, courseID []byte, index string) (bool, error) {
-	var ok bool
+	var ok intBool
 	err := s.db.QueryRowContext(ctx, `
-SELECT EXISTS(SELECT 1 FROM roster WHERE course_id = $1 AND index_number = $2)
+SELECT EXISTS(SELECT 1 FROM roster WHERE course_id = ? AND index_number = ?)
 `, courseID, index).Scan(&ok)
-	return ok, err
+	return bool(ok), err
 }
 
 // CreateLecture inserts an open lecture.
@@ -382,7 +391,7 @@ func (s *Store) CreateLecture(ctx context.Context, courseID []byte, startsAt int
 	var id []byte
 	err := withNewID(func(candidate []byte) error {
 		_, err := s.db.ExecContext(ctx, `
-INSERT INTO lectures (id, course_id, starts_at, ends_at) VALUES ($1, $2, $3, NULL)
+INSERT INTO lectures (id, course_id, starts_at, ends_at) VALUES (?, ?, ?, NULL)
 `, candidate, courseID, startsAt)
 		if err != nil {
 			return err
@@ -397,7 +406,7 @@ INSERT INTO lectures (id, course_id, starts_at, ends_at) VALUES ($1, $2, $3, NUL
 func (s *Store) GetLecture(ctx context.Context, id []byte) (Lecture, error) {
 	var lec Lecture
 	err := s.db.QueryRowContext(ctx, `
-SELECT id, course_id, starts_at, ends_at FROM lectures WHERE id = $1
+SELECT id, course_id, starts_at, ends_at FROM lectures WHERE id = ?
 `, id).Scan(&lec.ID, &lec.CourseID, &lec.StartsAt, &lec.EndsAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Lecture{}, ErrNotFound
@@ -411,7 +420,7 @@ func (s *Store) ListLectures(ctx context.Context, courseID []byte) ([]Lecture, e
 		return nil, err
 	}
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id, course_id, starts_at, ends_at FROM lectures WHERE course_id = $1 ORDER BY starts_at, id
+SELECT id, course_id, starts_at, ends_at FROM lectures WHERE course_id = ? ORDER BY starts_at, id
 `, courseID)
 	if err != nil {
 		return nil, err
@@ -432,9 +441,9 @@ SELECT id, course_id, starts_at, ends_at FROM lectures WHERE course_id = $1 ORDE
 func (s *Store) EndLecture(ctx context.Context, id []byte, now int64) (Lecture, error) {
 	var lec Lecture
 	err := s.db.QueryRowContext(ctx, `
-UPDATE lectures SET ends_at = $2 WHERE id = $1 AND ends_at IS NULL
+UPDATE lectures SET ends_at = ? WHERE id = ? AND ends_at IS NULL
 RETURNING id, course_id, starts_at, ends_at
-`, id, now).Scan(&lec.ID, &lec.CourseID, &lec.StartsAt, &lec.EndsAt)
+`, now, id).Scan(&lec.ID, &lec.CourseID, &lec.StartsAt, &lec.EndsAt)
 	if err == nil {
 		return lec, nil
 	}
@@ -450,17 +459,14 @@ RETURNING id, course_id, starts_at, ends_at
 // SubmitSensor inserts a sensor attendance row or applies the chirp upgrade.
 // The returned row is the stored row after the upgrade rule.
 func (s *Store) SubmitSensor(ctx context.Context, row Attendance) (Attendance, error) {
-	var out Attendance
-	err := s.db.QueryRowContext(ctx, `
+	out, err := s.scanAttendance(s.db.QueryRowContext(ctx, `
 INSERT INTO attendance (index_number, lecture_id, nonce, issued_at, rssi, chirp_ok, source, created_at)
-VALUES ($1, $2, $3, $4, $5, $6, 'sensor', $7)
+VALUES (?, ?, ?, ?, ?, ?, 'sensor', ?)
 ON CONFLICT (index_number, lecture_id) DO UPDATE
-SET chirp_ok = TRUE, source = 'sensor'
-WHERE attendance.chirp_ok = FALSE AND EXCLUDED.chirp_ok = TRUE
+SET chirp_ok = 1, source = 'sensor'
+WHERE attendance.chirp_ok = 0 AND excluded.chirp_ok = 1
 RETURNING index_number, lecture_id, nonce, issued_at, rssi, chirp_ok, source, created_at
-`, row.IndexNumber, row.LectureID, row.Nonce, row.IssuedAt, row.RSSI, row.ChirpOK, row.CreatedAt).Scan(
-		&out.IndexNumber, &out.LectureID, &out.Nonce, &out.IssuedAt, &out.RSSI, &out.ChirpOK, &out.Source, &out.CreatedAt,
-	)
+`, row.IndexNumber, row.LectureID, row.Nonce, row.IssuedAt, row.RSSI, boolInt(row.ChirpOK), row.CreatedAt))
 	if err == nil {
 		return out, nil
 	}
@@ -472,13 +478,10 @@ RETURNING index_number, lecture_id, nonce, issued_at, rssi, chirp_ok, source, cr
 
 // GetAttendance returns one attendance row.
 func (s *Store) GetAttendance(ctx context.Context, index string, lectureID []byte) (Attendance, error) {
-	var out Attendance
-	err := s.db.QueryRowContext(ctx, `
+	out, err := s.scanAttendance(s.db.QueryRowContext(ctx, `
 SELECT index_number, lecture_id, nonce, issued_at, rssi, chirp_ok, source, created_at
-FROM attendance WHERE index_number = $1 AND lecture_id = $2
-`, index, lectureID).Scan(
-		&out.IndexNumber, &out.LectureID, &out.Nonce, &out.IssuedAt, &out.RSSI, &out.ChirpOK, &out.Source, &out.CreatedAt,
-	)
+FROM attendance WHERE index_number = ? AND lecture_id = ?
+`, index, lectureID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return Attendance{}, ErrNotFound
 	}
@@ -488,15 +491,12 @@ FROM attendance WHERE index_number = $1 AND lecture_id = $2
 // SubmitManual inserts a manual row when none exists and otherwise returns the stored row unchanged.
 func (s *Store) SubmitManual(ctx context.Context, lectureID []byte, index string, now int64) (Attendance, error) {
 	nonce := make([]byte, 8)
-	var out Attendance
-	err := s.db.QueryRowContext(ctx, `
+	out, err := s.scanAttendance(s.db.QueryRowContext(ctx, `
 INSERT INTO attendance (index_number, lecture_id, nonce, issued_at, rssi, chirp_ok, source, created_at)
-VALUES ($1, $2, $3, $4, 0, FALSE, 'manual', $4)
+VALUES (?, ?, ?, ?, 0, 0, 'manual', ?)
 ON CONFLICT (index_number, lecture_id) DO NOTHING
 RETURNING index_number, lecture_id, nonce, issued_at, rssi, chirp_ok, source, created_at
-`, index, lectureID, nonce, now).Scan(
-		&out.IndexNumber, &out.LectureID, &out.Nonce, &out.IssuedAt, &out.RSSI, &out.ChirpOK, &out.Source, &out.CreatedAt,
-	)
+`, index, lectureID, nonce, now, now))
 	if err == nil {
 		return out, nil
 	}
@@ -515,7 +515,7 @@ func (s *Store) ListLectureAttendance(ctx context.Context, lectureID []byte) ([]
 SELECT a.index_number, s.display_name, a.rssi, a.chirp_ok, a.source, a.created_at
 FROM attendance a
 JOIN students s ON s.index_number = a.index_number
-WHERE a.lecture_id = $1
+WHERE a.lecture_id = ?
 ORDER BY a.index_number
 `, lectureID)
 	if err != nil {
@@ -525,9 +525,11 @@ ORDER BY a.index_number
 	out := []LectureAttendance{}
 	for rows.Next() {
 		var row LectureAttendance
-		if err := rows.Scan(&row.IndexNumber, &row.DisplayName, &row.RSSI, &row.ChirpOK, &row.Source, &row.CreatedAt); err != nil {
+		var chirp intBool
+		if err := rows.Scan(&row.IndexNumber, &row.DisplayName, &row.RSSI, &chirp, &row.Source, &row.CreatedAt); err != nil {
 			return nil, err
 		}
+		row.ChirpOK = bool(chirp)
 		out = append(out, row)
 	}
 	return out, rows.Err()
@@ -539,7 +541,7 @@ func (s *Store) CourseSummary(ctx context.Context, courseID []byte) (int, []Summ
 		return 0, nil, err
 	}
 	var held int
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM lectures WHERE course_id = $1`, courseID).Scan(&held); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM lectures WHERE course_id = ?`, courseID).Scan(&held); err != nil {
 		return 0, nil, err
 	}
 	rows, err := s.db.QueryContext(ctx, `
@@ -549,7 +551,7 @@ SELECT s.index_number, s.display_name,
     WHERE a.index_number = r.index_number AND l.course_id = r.course_id)
 FROM roster r
 JOIN students s ON s.index_number = r.index_number
-WHERE r.course_id = $1
+WHERE r.course_id = ?
 ORDER BY s.index_number
 `, courseID)
 	if err != nil {
@@ -584,6 +586,14 @@ func (s *Store) queryCourses(ctx context.Context, query string, args ...any) ([]
 	return out, rows.Err()
 }
 
+func (s *Store) scanAttendance(row *sql.Row) (Attendance, error) {
+	var out Attendance
+	var chirp intBool
+	err := row.Scan(&out.IndexNumber, &out.LectureID, &out.Nonce, &out.IssuedAt, &out.RSSI, &chirp, &out.Source, &out.CreatedAt)
+	out.ChirpOK = bool(chirp)
+	return out, err
+}
+
 var errPrimary = errors.New("primary key collision")
 
 func withNewID(insert func([]byte) error) error {
@@ -602,13 +612,65 @@ func withNewID(insert func([]byte) error) error {
 }
 
 func isUnique(err error) bool {
-	var pg *pgconn.PgError
-	return errors.As(err, &pg) && pg.Code == "23505"
+	se, ok := sqliteErr(err)
+	if !ok {
+		return false
+	}
+	code := se.Code()
+	if code != 19 && code != 1555 && code != 2067 {
+		return strings.Contains(se.Error(), "UNIQUE constraint failed")
+	}
+	return true
 }
 
 func isPrimaryKey(err error) bool {
-	var pg *pgconn.PgError
-	return errors.As(err, &pg) && pg.Code == "23505" && pg.ConstraintName != "" && len(pg.ConstraintName) >= 5 && pg.ConstraintName[len(pg.ConstraintName)-5:] == "_pkey"
+	se, ok := sqliteErr(err)
+	if !ok {
+		return false
+	}
+	if se.Code() == 1555 {
+		return true
+	}
+	msg := se.Error()
+	return strings.Contains(msg, "PRIMARY KEY") ||
+		strings.Contains(msg, "lecturers.id") ||
+		strings.Contains(msg, "courses.id") ||
+		strings.Contains(msg, "lectures.id")
+}
+
+func sqliteErr(err error) (*sqlite.Error, bool) {
+	var se *sqlite.Error
+	if errors.As(err, &se) {
+		return se, true
+	}
+	return nil, false
+}
+
+func boolInt(v bool) int {
+	if v {
+		return 1
+	}
+	return 0
+}
+
+type intBool bool
+
+func (b *intBool) Scan(src any) error {
+	switch v := src.(type) {
+	case bool:
+		*b = intBool(v)
+	case int64:
+		*b = intBool(v != 0)
+	case int:
+		*b = intBool(v != 0)
+	case []byte:
+		*b = intBool(len(v) > 0 && v[0] != '0' && string(v) != "false")
+	case string:
+		*b = intBool(v != "" && v != "0" && !strings.EqualFold(v, "false"))
+	default:
+		return fmt.Errorf("scan bool from %T", src)
+	}
+	return nil
 }
 
 func bytesEqual(a, b []byte) bool {

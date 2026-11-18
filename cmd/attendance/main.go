@@ -15,11 +15,11 @@ func main() {
 	if port == "" {
 		port = "8080"
 	}
-	databaseURL := os.Getenv("DATABASE_URL")
-	if databaseURL == "" {
-		log.Fatal("DATABASE_URL is required")
+	dbPath := os.Getenv("ATTENDANCE_DB")
+	if dbPath == "" {
+		dbPath = "attendance.db"
 	}
-	db, err := store.Open(databaseURL)
+	db, err := store.Open(dbPath)
 	if err != nil {
 		log.Fatal(err)
 	}
