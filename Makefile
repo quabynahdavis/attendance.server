@@ -1,4 +1,4 @@
-.PHONY: env run dev test docker up build
+.PHONY: env run dev test docker up build seed
 
 env:
 	@test -f .env || cp .env.example .env
@@ -15,6 +15,9 @@ test:
 build:
 	mkdir -p bin
 	go build -o ./bin/attendance ./cmd/attendance
+
+seed: env
+	set -a && . ./.env && set +a && go run ./cmd/seed
 
 docker:
 	docker build -t attendance .
